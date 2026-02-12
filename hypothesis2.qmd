@@ -1,0 +1,343 @@
+```{r}
+#| label: setup
+#| message: false
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(here)
+library(tidyr)
+library(scales)
+library(sf)
+
+here::i_am("hypothesis2.qmd")
+```
+
+```{r}
+#| label: load-data
+# Load data and define the analysis window.
+taxi <- read_csv(here("data", "taxidata_clean.csv"), show_col_types = FALSE) %>%
+  mutate(
+    year = year(trip_start_timestamp),
+    pickup_community_area = as.integer(pickup_community_area)
+  )
+
+late_hours <- c(23, 0, 1, 2, 3, 4)
+
+taxi_clean <- taxi %>%
+  filter(year %in% c(2014, 2019), !is.na(pickup_community_area)) %>%
+  mutate(
+    hour  = hour(trip_start_timestamp),
+    late  = hour %in% late_hours,
+    dow   = wday(trip_start_timestamp),
+    month = month(trip_start_timestamp)
+  )
+```
+
+### Per-area proportion tests with BH and BY correction
+
+```{r}
+#| label: area-tests
+# Official City of Chicago community area names via Socrata open-data API.
+# This avoids hard-coding names and ensures alignment with the city's numbering.
+ca_lookup <- read_sf("https://data.cityofchicago.org/resource/igwz-8jzy.geojson") %>%
+  st_drop_geometry() %>%
+  transmute(
+    pickup_community_area = as.integer(area_num_1),
+    area_name = tools::toTitleCase(tolower(community))
+  ) %>%
+  arrange(pickup_community_area)
+
+# Area-year summary table.
+area_year <- taxi_clean %>%
+  group_by(pickup_community_area, year) %>%
+  summarise(
+    n_total = n(),
+    n_late  = sum(late),
+    .groups = "drop"
+  )
+
+area_wide <- area_year %>%
+  pivot_wider(
+    names_from  = year,
+    values_from = c(n_total, n_late),
+    values_fill = list(n_total = 0, n_late = 0)
+  )
+
+# One proportion test per area, then BH and BY correction.
+test_results <- area_wide %>%
+  filter(n_total_2014 >= 200, n_total_2019 >= 200) %>%
+  rowwise() %>%
+  mutate(
+    p_value = prop.test(
+      c(n_late_2014, n_late_2019),
+      c(n_total_2014, n_total_2019),
+      correct = FALSE
+    )$p.value
+  ) %>%
+  ungroup() %>%
+  left_join(ca_lookup, by = "pickup_community_area") %>%
+  mutate(
+    late_share_2014 = n_late_2014 / n_total_2014,
+    late_share_2019 = n_late_2019 / n_total_2019,
+    share_change = late_share_2019 - late_share_2014,
+    p_adj_bh = p.adjust(p_value, method = "BH"),
+    p_adj_by = p.adjust(p_value, method = "BY"),
+    bh_reject = p_adj_bh < 0.05,
+    by_reject = p_adj_by < 0.05
+  ) %>%
+  arrange(p_adj_bh)
+
+test_results %>%
+  select(
+    pickup_community_area, area_name,
+    n_total_2014, n_total_2019,
+    late_share_2014, late_share_2019, share_change,
+    p_value, p_adj_bh, p_adj_by, bh_reject
+  ) %>%
+  slice_head(n = 15)
+```
+
+### Supplementary global-null tests
+
+```{r}
+#| label: global-null
+m <- nrow(test_results)
+
+fisher_stat <- -2 * sum(log(test_results$p_value))
+fisher_p <- pchisq(fisher_stat, df = 2 * m, lower.tail = FALSE)
+
+p_sorted <- sort(test_results$p_value)
+simes_p <- min(1, min(p_sorted * m / seq_len(m)))
+
+tibble(
+  test    = c("Fisher combination", "Simes"),
+  p_value = c(fisher_p, simes_p)
+)
+```
+
+
+### Discovery counts
+
+```{r}
+#| label: discoveries
+tibble(
+  method      = c("BH (FDR control)", "BY (FDR under dependence)"),
+  discoveries = c(sum(test_results$bh_reject), sum(test_results$by_reject)),
+  tested      = c(m, m)
+)
+```
+
+```{r}
+#| label: direction-check
+# Verify the direction of all BH discoveries.
+n_decline <- sum(test_results$bh_reject & test_results$share_change < 0)
+n_increase <- sum(test_results$bh_reject & test_results$share_change > 0)
+tibble(
+  direction = c("Decline (share_change < 0)", "Increase (share_change > 0)"),
+  n_discoveries = c(n_decline, n_increase)
+)
+```
+
+
+### Visualization
+
+```{r}
+#| label: fig-share-change
+#| fig-cap: "Change in late-night taxi share by community area (2019 minus 2014). Blue bars are BH-significant at FDR 5%; grey bars are not."
+plot_df <- test_results %>%
+  slice_max(order_by = abs(share_change), n = 20) %>%
+  mutate(area_label = paste0(pickup_community_area, " - ", area_name))
+
+ggplot(plot_df, aes(x = reorder(area_label, share_change), y = share_change, fill = bh_reject)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+  scale_fill_manual(
+    values = c("FALSE" = "grey70", "TRUE" = "#1f78b4"),
+    labels = c("FALSE" = "Not rejected", "TRUE" = "Rejected")
+  ) +
+  labs(
+    title = "Largest Changes in Late-Night Taxi Share",
+    subtitle = "Blue = BH-significant at FDR 5%",
+    x = NULL,
+    y = "Change in late-night share (pp)",
+    fill = "BH (alpha = 0.05)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+
+### Grouped comparison: pre-specified area sets
+
+
+```{r}
+#| label: group-test
+nightlife_residential <- c(6, 7, 8, 22, 24)
+airport_downtown_business <- c(28, 32, 33, 76)
+
+group_year <- area_year %>%
+  mutate(
+    area_group = case_when(
+      pickup_community_area %in% nightlife_residential ~ "Nightlife/Residential",
+      pickup_community_area %in% airport_downtown_business ~ "Airport/Downtown/Business",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(area_group != "Other") %>%
+  group_by(area_group, year) %>%
+  summarise(
+    n_total = sum(n_total),
+    n_late  = sum(n_late),
+    .groups = "drop"
+  )
+
+group_results <- group_year %>%
+  pivot_wider(
+    names_from  = year,
+    values_from = c(n_total, n_late)
+  ) %>%
+  mutate(
+    late_share_2014 = n_late_2014 / n_total_2014,
+    late_share_2019 = n_late_2019 / n_total_2019,
+    share_change    = late_share_2019 - late_share_2014
+  ) %>%
+  rowwise() %>%
+  mutate(
+    p_value = prop.test(
+      c(n_late_2014, n_late_2019),
+      c(n_total_2014, n_total_2019),
+      correct = FALSE
+    )$p.value
+  ) %>%
+  ungroup()
+
+group_results %>%
+  select(
+    area_group, n_total_2014, n_total_2019,
+    late_share_2014, late_share_2019, share_change, p_value
+  )
+```
+
+
+```{r}
+#| label: interaction-test
+# Difference-in-differences: year x group interaction test.
+interaction_data <- taxi_clean %>%
+  filter(
+    pickup_community_area %in% c(nightlife_residential, airport_downtown_business)
+  ) %>%
+  mutate(
+    nightlife = as.integer(pickup_community_area %in% nightlife_residential),
+    post      = as.integer(year == 2019)
+  )
+
+fit <- glm(late ~ post * nightlife, data = interaction_data, family = binomial)
+summary(fit)
+```
+
+```{r}
+#| label: interaction-coef
+# Extract and interpret the interaction coefficient.
+beta3 <- coef(fit)["post:nightlife"]
+se3 <- summary(fit)$coefficients["post:nightlife", "Std. Error"]
+p3 <- summary(fit)$coefficients["post:nightlife", "Pr(>|z|)"]
+tibble(
+  term       = "year2019 x nightlife (interaction)",
+  estimate   = beta3,
+  std_error  = se3,
+  p_value    = p3
+)
+```
+
+
+### Robustness: stratified permutation test
+
+```{r}
+#| label: permutation-test
+#| cache: true
+set.seed(42)
+B <- 2000
+
+# Observed late-night share difference per area.
+obs_diff <- taxi_clean %>%
+  group_by(pickup_community_area, year) %>%
+  summarise(late_share = mean(late), n = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from = year, values_from = c(late_share, n),
+    values_fill = list(late_share = NA, n = 0)
+  ) %>%
+  filter(n_2014 >= 200, n_2019 >= 200) %>%
+  mutate(obs_stat = late_share_2019 - late_share_2014)
+
+# Keep only areas passing the sample-size filter.
+areas_to_test <- obs_diff$pickup_community_area
+
+perm_data <- taxi_clean %>%
+  filter(pickup_community_area %in% areas_to_test) %>%
+  mutate(stratum = interaction(month, dow, drop = TRUE)) %>%
+  select(pickup_community_area, year, late, stratum)
+
+# Function: one permutation round for all areas.
+# We shuffle year labels within each (area, stratum) cell using base-R split-apply
+# to avoid the dplyr grouped-mutate size constraint.
+# Note: sample(x) when length(x)==1 is interpreted as sample.int(x,1), so we use
+# x[sample.int(length(x))] instead, which is safe for any length.
+one_perm <- function(df) {
+  idx <- split(seq_len(nrow(df)), list(df$pickup_community_area, df$stratum))
+  year_perm <- df$year # start as a copy; overwrite in place
+  for (i in idx) {
+    n_i <- length(i)
+    if (n_i > 1L) {
+      year_perm[i] <- df$year[i][sample.int(n_i)]
+    }
+    # n_i <= 1: nothing to permute
+  }
+  df$year_perm <- year_perm
+
+  df %>%
+    group_by(pickup_community_area, year_perm) %>%
+    summarise(late_share = mean(late), .groups = "drop") %>%
+    pivot_wider(names_from = year_perm, values_from = late_share) %>%
+    mutate(perm_stat = `2019` - `2014`) %>%
+    select(pickup_community_area, perm_stat)
+}
+
+# Run B permutations.
+perm_stats <- bind_rows(lapply(seq_len(B), function(b) {
+  one_perm(perm_data) %>% mutate(b = b)
+}))
+
+# Compute two-sided permutation p-values.
+perm_pvals <- perm_stats %>%
+  inner_join(obs_diff %>% select(pickup_community_area, obs_stat), by = "pickup_community_area") %>%
+  group_by(pickup_community_area) %>%
+  summarise(
+    perm_p = (sum(abs(perm_stat) >= abs(obs_stat)) + 1) / (n() + 1),
+    .groups = "drop"
+  )
+
+# Merge with test_results and apply BH.
+perm_results <- obs_diff %>%
+  select(pickup_community_area, obs_stat) %>%
+  inner_join(perm_pvals, by = "pickup_community_area") %>%
+  mutate(
+    perm_p_bh    = p.adjust(perm_p, method = "BH"),
+    perm_reject  = perm_p_bh < 0.05
+  ) %>%
+  arrange(perm_p_bh)
+
+perm_results <- perm_results %>%
+  left_join(ca_lookup, by = "pickup_community_area")
+
+perm_results %>%
+  select(pickup_community_area, area_name, obs_stat, perm_p, perm_p_bh, perm_reject) %>%
+  slice_head(n = 15)
+```
+
+```{r}
+#| label: perm-summary
+cat("Permutation-based BH discoveries:", sum(perm_results$perm_reject), "of", nrow(perm_results), "\n")
+cat("Parametric BH discoveries:       ", sum(test_results$bh_reject), "of", nrow(test_results), "\n")
+```
