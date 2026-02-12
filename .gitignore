@@ -2,3 +2,4 @@
 *.csv
 /.quarto/
 *_cache/
+.DS_Store
